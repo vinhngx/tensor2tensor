@@ -128,10 +128,7 @@ def DecoderBlock(d_model, d_ff, n_heads, dropout, mode):
   """
   self_attention = [
       tl.LayerNorm(),  # vec
-      tl.Dup(),  # vec vec
-      tl.Parallel([], tl.CausalMask(axis=-2)),  # vec mask
-      tl.Attention(d_model, n_heads=n_heads, dropout=dropout, mode=mode),
-      tl.Parallel([], tl.Drop()),  # vec
+      tl.CausalAttention(d_model, n_heads=n_heads, dropout=dropout, mode=mode),
       tl.Dropout(rate=dropout, mode=mode),  # vec
   ]
   feed_forward = [
@@ -141,6 +138,41 @@ def DecoderBlock(d_model, d_ff, n_heads, dropout, mode):
       tl.Residual(self_attention),
       tl.Residual(feed_forward),
   ]
+
+
+def TransformerDecoder(d_model=512,
+                       d_ff=2048,
+                       n_layers=6,
+                       n_heads=8,
+                       dropout=0.1,
+                       max_len=2048,
+                       mode='train'):
+  """Returns a Transformer decoder model.
+
+  The input to the model is a continuous tensor. Does not shift the input to the
+  right, i.e. the output for timestep t is based on inputs up to timestep t
+  inclusively.
+
+  Args:
+    d_model: int:  depth of embedding
+    d_ff: int: depth of feed-forward layer
+    n_layers: int: number of encoder/decoder layers
+    n_heads: int: number of attention heads
+    dropout: float: dropout rate (how much to drop out)
+    max_len: int: maximum symbol length for positional encoding
+    mode: str: 'train' or 'eval'
+
+  Returns:
+    A Transformer decoder as a layer that maps from a continuous tensor to
+    a continuous tensor.
+  """
+  return tl.Model(                  # vecs
+      tl.PositionalEncoding(max_len=max_len),
+      tl.Dense(d_model),            # vecs
+      [DecoderBlock(d_model, d_ff, n_heads, dropout, mode)
+       for _ in range(n_layers)],   # vecs
+      tl.LayerNorm(),               # vecs
+  )
 
 
 def TransformerLM(vocab_size,
@@ -205,10 +237,7 @@ def EncoderDecoder(d_model, d_ff, n_heads, dropout, mode):
   """
   decoder_self_attention = [                    #        vecs_d   pmask vecs_e
       tl.LayerNorm(),                           #        vecs_d   ..... ......
-      tl.Dup(),                                 # vecs_d vecs_d   ..... ......
-      tl.Parallel([], tl.CausalMask(axis=-2)),  # ______ masks    ..... ......
-      tl.Attention(d_model, n_heads=n_heads, dropout=dropout, mode=mode),
-      tl.Parallel([], tl.Drop()),               # ______   0      ..... ......
+      tl.CausalAttention(d_model, n_heads=n_heads, dropout=dropout, mode=mode),
       tl.Dropout(rate=dropout, mode=mode),      # vecs_d          ..... ......
   ]
   decoder_to_encoder_attention = [        # vecs_d        masks         vecs_e

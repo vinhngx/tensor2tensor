@@ -32,16 +32,19 @@ from tensor2tensor.trax.layers.combinators import _pop_rng_and_split
 
 
 class Map(tl.Layer):
-  """Combinator for applying a layer to a list or tuple.
+  """Combinator for applying a layer to a list or tuple."""
 
-  Args:
-    layer: a layer to apply to each element.
+  def __init__(self, layer, n_sections=1, check_shapes=True):
+    """Initialize the combinator.
 
-  Returns:
-    A new layer representing mapping layer to all elements of the input.
-  """
+    Args:
+      layer: a layer to apply to each element.
+      n_sections: how many sections to map to (default: 1).
+      check_shapes: whether to check that shapes are identical (default: true).
 
-  def __init__(self, layer, sections=1, check_shapes=True):
+    Returns:
+      A new layer representing mapping layer to all elements of the input.
+    """
     super(Map, self).__init__()
     if layer is None or isinstance(layer, (list, tuple)):
       layer = tl.Serial(layer)
@@ -52,21 +55,22 @@ class Map(tl.Layer):
     # are valid cases -- e.g., when self._layer has no parameters -- where we
     # can apply Map to different shapes -- set check_shapes=False in such cases.
     self._check_shapes = check_shapes
-    self._sections = sections
+    self._n_sections = n_sections
 
   def n_inputs(self):
     """Specifies how many data tensors this layer expects as input."""
-    return self._sections
+    return self._n_sections
 
   def n_outputs(self):
     """Specifies how many data tensors this layer promises as output."""
-    return self._sections
+    return self._n_sections
 
-  def call(self, inputs, params=(), **kwargs):
+  def call(self, inputs, params=(), state=(), **kwargs):
     rngs = _pop_rng_and_split(kwargs, len(inputs))
-    result = [self._layer(x, params=params, rng=r, **kwargs)
-              for x, r in zip(inputs, rngs)]
-    return tuple(result)
+    results = [self._layer(x, params=params, state=state, rng=r, **kwargs)
+               for x, r in zip(inputs, rngs)]
+    result_outputs, result_states = zip(*results)
+    return tuple(result_outputs), tuple(result_states)
 
   def new_parameters(self, input_shape, input_dtype, rng):
     first_shape = input_shape[0]
@@ -78,95 +82,54 @@ class Map(tl.Layer):
     return self._layer.initialize(first_shape, input_dtype[0], rng)
 
 
+@tl.layer()
+def BroadcastedDropout(x, params, rate=0.0, mode='train', broadcast_dims=(-2,),
+                       rng=None, **kwargs):
+  """Dropout, with broadcasting to save memory."""
+  del params, kwargs
+  if rng is None:
+    raise ValueError('BroadcastedDropout requires rng kwarg.')
+  if rate >= 1.0:
+    raise ValueError('Dropout rate (%f) must be lower than 1.' % rate)
+  if mode == 'train' and rate > 0.0:
+    noise_shape = list(x.shape)
+    for dim in broadcast_dims:
+      noise_shape[dim] = 1
+    keep_prob = jax.lax.tie_in(rng, 1.0 - rate)
+    keep = backend.random.bernoulli(rng, keep_prob, tuple(noise_shape))
+    multiplier = keep.astype(x.dtype) / jax.lax.tie_in(keep, keep_prob)
+    return x * multiplier
+  else:
+    return x
+
+
 def FeedForward(d_model, d_ff, dropout, mode):
   """Feed-forward block with layer normalization at start."""
-  # TODO(kitaev): add dropout. Dropout is typically performed by adding noise to
-  # the activations, but when the size of the activations is very large it is
-  # more efficient to add noise to the *parameters* instead.
-  del dropout, mode
   return [
       tl.LayerNorm(),
       tl.Dense(d_ff),
+      BroadcastedDropout(rate=dropout, mode=mode),  # pylint: disable=no-value-for-parameter
       tl.Relu(),
       tl.Dense(d_model),
+      BroadcastedDropout(rate=dropout, mode=mode),  # pylint: disable=no-value-for-parameter
   ]
-
-
-class ReversibleLayerMixin(object):
-  """Reversible Layer Mixin."""
-
-  def inverse_and_vjp(self, output, ct, params=(), **kwargs):
-    """Backward pass: computes the inverse of a layer and propagates gradients.
-
-    Args:
-      output: Output activations; can be a (possibly nested) tuple.
-      ct: gradient signal (cotangent) computed based on subsequent layers. If
-          None, no gradients are propagated. Otherwise the structure and shape
-          must match the output.
-      params: layer parameters
-      **kwargs: kwargs for the layer
-
-    Returns:
-      A tuple (x, x_ct), where x is the reconstructed input and x_ct is the
-      gradient signal for the input. If ct is None, x_ct will also be None.
-    """
-    if ct is None:
-      # Subclasses must override inverse_and_vjp, but in the case where ct is
-      # not None there is an unoptimized implementation below that they can
-      # delegate to.
-      raise NotImplementedError
-
-    # Note: jax.vjp does not allow us to use **kwargs in the signature here.
-    def _do_call(x, params, kwargs):
-      return super(ReversibleLayerMixin, self).__call__(x, params, **kwargs)
-
-    reconstructed_x, must_be_none = self.inverse_and_vjp(
-        output, None, params, **kwargs)
-    assert must_be_none is None
-    _, vjpfun = jax.vjp(_do_call, reconstructed_x, params, kwargs)
-    input_ct = vjpfun(ct)
-    return reconstructed_x, input_ct
-
-  def __call__(self, x, params=(), **kwargs):
-    assert backend.get_name() == 'jax', (
-        'Reversible layers are only supported in JAX')
-
-    if params is () and self._params:  # pylint: disable=literal-comparison
-      # TODO(kitaev): Figure out why parameter sharing doesn't work (if this
-      # explicit error isn't thrown, a jax tracer error occurs instead)
-      raise NotImplementedError(
-          'Parameter sharing between reversible layers is not implemented.')
-
-    @jax.custom_transforms
-    def do_call(x, params, kwargs):
-      return super(ReversibleLayerMixin, self).__call__(x, params, **kwargs)
-
-    def do_call_vjp(x, params, kwargs):
-      output = super(ReversibleLayerMixin, self).__call__(x, params, **kwargs)
-      def vjpfun(ct):
-        _, input_ct = self.inverse_and_vjp(output, ct, params, **kwargs)
-        return input_ct
-
-      return output, vjpfun
-
-    jax.defvjp_all(do_call, do_call_vjp)
-    return do_call(x, params, kwargs)
 
 
 class Split(tl.Layer):
   """Splits the input into sections along an axis."""
 
-  def __init__(self, sections=2, axis=-1):
+  def __init__(self, n_sections=2, axis=-1):
     super(Split, self).__init__()
-    self._sections = sections
+    self._n_sections = n_sections
     self._axis = axis
 
-  def call(self, inputs, params=(), **kwargs):
+  def call(self, inputs, params=(), state=(), **kwargs):
     del params, kwargs
-    return tuple(backend.numpy.split(inputs, self._sections, self._axis))
+    res = tuple(backend.numpy.split(inputs, self._n_sections, self._axis))
+    return res, state
 
   def new_parameters(self, input_shapes, input_dtype, rng):
-    return ()
+    return (), ()
 
   def n_inputs(self):
     """Specifies how many data tensors this layer expects as input."""
@@ -174,30 +137,91 @@ class Split(tl.Layer):
 
   def n_outputs(self):
     """Specifies how many data tensors this layer promises as output."""
-    return self._sections
+    return self._n_sections
+
+
+class SplitForOutput(tl.ReversibleLayer):
+  """Splits activations into sections (for use right before the output layer).
+
+  After the reversible portion of the network, there is a final output portion
+  that's non-reversible (which at minimum includes normalization, output
+  projection, and log-softmax). The output portion needs to operate on chunks
+  of the sequence to avoid running out of memory for large vocabulary sizes.
+
+  This layer concatenates the two subparts of the activations along the feature
+  dimension, and then splits into chunks along the time dimension. We implement
+  it is a subclass of tl.ReversibleLayer because we want to ensure that multiple
+  copies of the activations don't exist simultaneously except in the middle of a
+  memory copy operation.
+  """
+
+  def __init__(self, n_sections=2, axis=-2):
+    super(SplitForOutput, self).__init__()
+    self._n_sections = n_sections
+    self._axis = axis
+
+  def n_inputs(self):
+    """Specifies how many data tensors this layer expects as input."""
+    return 2
+
+  def n_outputs(self):
+    """Specifies how many data tensors this layer promises as output."""
+    return self._n_sections
+
+  def new_parameters(self, input_shape, input_dtype, rng):
+    return (), ()
+
+  def call(self, inputs, params=(), state=(), **kwargs):
+    del params, kwargs
+    x1, x2 = inputs
+
+    x1_split = backend.numpy.split(x1, self._n_sections, self._axis)
+    x2_split = backend.numpy.split(x2, self._n_sections, self._axis)
+
+    res = [backend.numpy.concatenate(ys, -1) for ys in zip(x1_split, x2_split)]
+    return tuple(res), state
+
+  def reverse(self, output, params=(), **kwargs):
+    del params, kwargs
+
+    x1_split = []
+    x2_split = []
+    for y in output:
+      y1, y2 = backend.numpy.split(y, 2, -1)
+      x1_split.append(y1)
+      x2_split.append(y2)
+
+    x1 = backend.numpy.concatenate(x1_split, self._axis)
+    x2 = backend.numpy.concatenate(x2_split, self._axis)
+
+    return (x1, x2)
+
+  def reverse_and_grad(self, output, ct, params=(), **kwargs):
+    del params, kwargs
+    return self.reverse(output), (self.reverse(ct), ())
 
 
 @tl.layer()
-def Chunk(x, params, sections=2, **kwargs):
+def Chunk(x, params, n_sections=2, **kwargs):
   del params, kwargs
-  assert x.shape[1] % sections == 0
+  assert x.shape[1] % n_sections == 0
   return backend.numpy.reshape(x, (
-      x.shape[0] * sections,
-      x.shape[1] // sections,
+      x.shape[0] * n_sections,
+      x.shape[1] // n_sections,
       ) + x.shape[2:])
 
 
 @tl.layer()
-def Unchunk(x, params, sections=2, **kwargs):
+def Unchunk(x, params, n_sections=2, **kwargs):
   del params, kwargs
-  assert x.shape[0] % sections == 0
+  assert x.shape[0] % n_sections == 0
   return backend.numpy.reshape(x, (
-      x.shape[0] // sections,
-      x.shape[1] * sections,
+      x.shape[0] // n_sections,
+      x.shape[1] * n_sections,
       ) + x.shape[2:])
 
 
-class ReversibleHalfResidual(ReversibleLayerMixin, tl.Serial):
+class ReversibleHalfResidual(tl.ReversibleLayer, tl.Serial):
   """Half of a RevNet-style residual (only updates part of the hidden state)."""
 
   def __init__(self, residual_layers):
@@ -217,57 +241,104 @@ class ReversibleHalfResidual(ReversibleLayerMixin, tl.Serial):
     self.subtract_top = tl.Parallel(tl.SubtractTop(), [])
     self.reverse_layers = [self.compute_residual, self.subtract_top]
 
-  def inverse_and_vjp(self, output, ct, params=(), **kwargs):
+  def reverse(self, output, params=(), **kwargs):
+    reconstructed_x = output
+    rng = kwargs.pop('rng', None)
+    rngs = (None,) * self._n_layers
+    if rng is not None:
+      rngs = backend.random.split(rng, self._n_layers)
+    # Note that self.sublayers() aligns exactly with self.reverse_layers in
+    # terms of parameter and rng usage, so no re-ordering is required.
+    for layer, p, rng in zip(self.reverse_layers, params, rngs):
+      reconstructed_x = layer(reconstructed_x, p, rng=rng, **kwargs)
+    return reconstructed_x
+
+  def reverse_and_grad(self, output, ct, params=(), **kwargs):
     rng = kwargs.pop('rng', None)
     rngs = (None,) * self._n_layers
     if rng is not None:
       rngs = backend.random.split(rng, self._n_layers)
 
-    if ct is None:
-      reconstructed_x = output
-      # Note that self.sublayers() aligns exactly with self.reverse_layers in
-      # terms of parameter and rng usage, so no re-ordering is required.
-      for layer, p, rng in zip(self.reverse_layers, params, rngs):
-        reconstructed_x = layer(reconstructed_x, p, rng=rng, **kwargs)
-      return reconstructed_x, None
-    else:
-      # Note: jax.vjp does not allow us to use **kwargs in the signature here.
-      def call_compute_residual(x, params, kwargs):
-        return self.compute_residual(x, params, **kwargs)
+    def call_compute_residual(x, params):
+      return self.compute_residual(x, params, rng=rngs[0], **kwargs)
 
-      assert len(ct) == 2
-      ct = ((ct[0], ct[0], ct[1]))
+    assert len(ct) == 2
+    ct = ((ct[0], ct[0], ct[1]))
 
-      compute_residual_kwargs = kwargs.copy()
-      compute_residual_kwargs['rng'] = rngs[0]
-      stack_with_residual, vjpfun = jax.vjp(
-          call_compute_residual, output, params[0], compute_residual_kwargs)
-      reconstructed_x = self.subtract_top(
-          stack_with_residual, params[-1], rng=rngs[-1], **kwargs)
+    stack_with_residual, vjpfun = jax.vjp(
+        call_compute_residual, output, params[0])
+    reconstructed_x = self.subtract_top(
+        stack_with_residual, params[-1], rng=rngs[-1], **kwargs)
 
-      x_ct, residual_params_ct, kwargs_ct = vjpfun(ct)
-      return reconstructed_x, (x_ct, (residual_params_ct, ()), kwargs_ct)
+    x_ct, residual_params_ct = vjpfun(ct)
+    return reconstructed_x, (x_ct, (residual_params_ct, ()))
 
 
-@tl.layer(n_inputs=1, n_outputs=1)
-def SplitHeads(x, params, n_heads=1, **kwargs):
-  del params, kwargs
-  d_model = x.shape[-1]
-  assert d_model % n_heads == 0
-  d_head = d_model // n_heads
-  n_batch = np.shape(x)[0]
-  # n_batch, seqlen, d_model --> n_batch, n_heads, seqlen, d_head
-  return np.transpose(
-      np.reshape(x, (n_batch, -1, n_heads, d_head)), (0, 2, 1, 3))
+class ComputeAttentionHeads(tl.Layer):
+  """Computes queries/keys/values via linear projection.
+
+  The output shape is (n_batch * n_heads, seqlen, d_head); the batch and head
+  dimensions are fused to allow for more efficient memory layouts.
+  """
+
+  def __init__(self, n_heads=1, d_head=64,
+               kernel_initializer=tl.initializers.GlorotUniformInitializer()):
+    super(ComputeAttentionHeads, self).__init__()
+    self._n_heads = n_heads
+    self._d_head = d_head
+    self._kernel_initializer = kernel_initializer
+    # The lack of a bias term here is consistent with the tensor2tensor
+    # implementation, and shouldn't have an effect on modeling quality.
+
+  def call(self, x, params, state, **kwargs):
+    del kwargs
+    seqlen = x.shape[1]
+    res = np.dot(x, params)
+
+    # n_batch, seqlen, n_heads*d_head -> n_batch, seqlen, n_heads, d_head
+    res = np.reshape(res, (x.shape[0], seqlen, self._n_heads, self._d_head))
+    # n_batch, seqlen, n_heads, d_head -> n_batch, n_heads, seqlen, d_head
+    res = np.transpose(res, (0, 2, 1, 3))
+    # n_batch, n_heads, seqlen, d_head -> n_batch*n_heads, seqlen, d_head
+    res = np.reshape(res, (-1, seqlen, self._d_head))
+
+    return res, state
+
+  def new_parameters(self, input_shape, input_dtype, rng):
+    del input_dtype
+    w = self._kernel_initializer(
+        (input_shape[-1], self._n_heads * self._d_head), rng)
+    return w, ()
 
 
-@tl.layer(n_inputs=1, n_outputs=1)
-def JoinHeads(x, params, **kwargs):
-  del params, kwargs
-  n_batch = np.shape(x)[0]
-  seqlen = np.shape(x)[2]
-  # n_batch, n_heads, seqlen, d_head --> n_batch, seqlen, d_model
-  return np.reshape(np.transpose(x, (0, 2, 1, 3)), (n_batch, seqlen, -1))
+class ComputeAttentionOutput(tl.Layer):
+  """Joins outputs from different heads via linear projection."""
+
+  def __init__(self, n_heads=1, d_model=1024,
+               kernel_initializer=tl.initializers.GlorotUniformInitializer()):
+    super(ComputeAttentionOutput, self).__init__()
+    self._n_heads = n_heads
+    self._d_model = d_model
+    self._kernel_initializer = kernel_initializer
+    # The lack of a bias term here is consistent with the tensor2tensor
+    # implementation, and shouldn't have an effect on modeling quality.
+
+  def call(self, x, params, state, **kwargs):
+    del kwargs
+    seqlen = x.shape[1]
+    d_head = x.shape[2]
+
+    x = np.reshape(x, (-1, self._n_heads, seqlen, d_head))
+    x = np.transpose(x, (0, 2, 1, 3))  # -> n_batch, seqlen, n_heads, d_head
+    x = np.reshape(x, (-1, seqlen, self._n_heads * d_head))
+
+    return np.dot(x, params), state
+
+  def new_parameters(self, input_shape, input_dtype, rng):
+    del input_dtype
+    w = self._kernel_initializer(
+        (input_shape[-1] * self._n_heads, self._d_model), rng)
+    return w, ()
 
 
 class ApplyAttentionWrapper(tl.Parallel):
@@ -305,14 +376,14 @@ class DotProductAttention(tl.Layer):
     self._dropout = dropout
     self._mode = mode
 
-  def call(self, inputs, params=(), rng=None, **kwargs):
+  def call(self, inputs, params=(), state=(), rng=None, **kwargs):
     del params
     q, k, v = inputs
     mask_size = q.shape[-2]
     mask = np.tril(np.ones((1, mask_size, mask_size), dtype=onp.bool_), k=0)
     res = tl.DotProductAttention(
         q, k, v, mask, dropout=self._dropout, mode=self._mode, rng=rng)
-    return res
+    return res, state
 
   def forward_and_vjp(self, inputs, ct, params=(), **kwargs):
     # Simultaneous forward pass and backprop through the attention mechanism.
@@ -322,7 +393,7 @@ class DotProductAttention(tl.Layer):
     return output, vjpfun(ct)[0]
 
   def new_parameters(self, input_shapes, input_dtype, rng):
-    return ()
+    return (), ()
 
   def n_inputs(self):
     return 3
@@ -337,12 +408,18 @@ class MemoryEfficientDotProductAttention(DotProductAttention):
   def __init__(self, loop_stride, dropout, mode):
     super(MemoryEfficientDotProductAttention, self).__init__(dropout, mode)
     self._loop_stride = loop_stride
+    if dropout >= 1.0:
+      raise ValueError('Dropout rates must be lower than 1.')
+    if mode == 'train':
+      self.dropout = dropout
+    else:
+      self.dropout = None
 
-  def call(self, inputs, params=(), **kwargs):
+  def call(self, inputs, params=(), state=(), **kwargs):
     output, _ = self.forward_and_vjp(inputs, None, params=params, **kwargs)
-    return output
+    return output, state
 
-  def forward_and_vjp(self, inputs, ct, params=(), **kwargs):
+  def forward_and_vjp(self, inputs, ct, params=(), rng=None, **kwargs):
     # This is the core of the memory-efficient attention implementation, where
     # we use the jax.lax.while_loop primitive to compute attention for a small
     # set of query positions at a time. Note how in the backwards pass, we
@@ -381,16 +458,30 @@ class MemoryEfficientDotProductAttention(DotProductAttention):
       # Softmax.
       dots = np.exp(dots - dots.max(axis=-1, keepdims=True))
       dots = dots / dots.sum(axis=-1, keepdims=True)
+
+      if self.dropout is not None and self.dropout > 0.0:
+        # Dropout is broadcast across the batch+head dimension
+        dropout_shape = (1, dots.shape[-2], dots.shape[-1])
+        slice_rng = jax.random.fold_in(rng, q_loop_idx)
+        keep_prob = jax.lax.tie_in(dots, 1.0 - self.dropout)
+        keep = backend.random.bernoulli(slice_rng, keep_prob, dropout_shape)
+        multiplier = keep.astype(dots.dtype) / jax.lax.tie_in(keep, keep_prob)
+        dots = dots * multiplier
+
       out_slice = np.matmul(dots, value)
       return out_slice
 
     def forward_and_vjp_slice(query_slice, q_loop_idx, key, value, ct_slice):
+      # Capture q_loop_idx to avoid calculated gradients wrt. it.
+      def forward_slice_with_q_loop_idx(query_slice, key, value):
+        return forward_slice(query_slice, q_loop_idx, key, value)
+
       output_slice, vjpfun = jax.vjp(
-          forward_slice, query_slice, q_loop_idx, key, value)
+          forward_slice_with_q_loop_idx, query_slice, key, value)
       return output_slice, vjpfun(ct_slice)
 
     q_loop_idx = np.zeros((), dtype=np.int32)
-    q_loop_max = query.shape[2]
+    q_loop_max = query.shape[-2]
     q_loop_stride = self._loop_stride
     assert q_loop_max % q_loop_stride == 0, (
         'Stride must evenly divide the number of query elements.')
@@ -419,23 +510,22 @@ class MemoryEfficientDotProductAttention(DotProductAttention):
         q_loop_idx, out_accum = vals
 
       query_slice = jax.lax.dynamic_slice_in_dim(
-          query, q_loop_idx, q_loop_stride, axis=2)
+          query, q_loop_idx, q_loop_stride, axis=-2)
 
       if do_backprop:
         ct_slice = jax.lax.dynamic_slice_in_dim(
-            ct, q_loop_idx, q_loop_stride, axis=2)
+            ct, q_loop_idx, q_loop_stride, axis=-2)
         out_slice, partial_ct = forward_and_vjp_slice(
             query_slice, q_loop_idx, key, value, ct_slice)
         query_ct_accum = jax.lax.dynamic_update_slice_in_dim(
-            query_ct_accum, partial_ct[0], q_loop_idx, axis=2)
-        # ignore partial_ct[1], which is wrt the loop idx
-        key_ct_accum = key_ct_accum + partial_ct[2]
-        value_ct_accum = value_ct_accum + partial_ct[3]
+            query_ct_accum, partial_ct[0], q_loop_idx, axis=-2)
+        key_ct_accum = key_ct_accum + partial_ct[1]
+        value_ct_accum = value_ct_accum + partial_ct[2]
       else:
         out_slice = forward_slice(query_slice, q_loop_idx, key, value)
 
       out_accum = jax.lax.dynamic_update_slice_in_dim(
-          out_accum, out_slice, q_loop_idx, axis=2)
+          out_accum, out_slice, q_loop_idx, axis=-2)
       q_loop_idx = q_loop_idx + q_loop_stride
 
       if do_backprop:
@@ -452,7 +542,118 @@ class MemoryEfficientDotProductAttention(DotProductAttention):
       return final_vals[1], final_vals[2:]
 
 
-class ReversibleAttentionHalfResidual(ReversibleLayerMixin, tl.Serial):
+class DummyHashedAttention(DotProductAttention):
+  """A stand-in for hash-based attention, but without a real hash function."""
+
+  def __init__(self, dropout, mode, n_bins=64):
+    super(DummyHashedAttention, self).__init__(dropout, mode)
+    self.n_bins = n_bins
+
+  def call(self, inputs, params=(), state=(), **kwargs):
+    output, _ = self.forward_and_vjp(inputs, None, params=params, **kwargs)
+    return output, state
+
+  def forward_and_vjp(self, inputs, ct, params=(), **kwargs):
+    del params, kwargs
+    q, k, v = inputs
+    # q/k/v are n_batch*n_heads, seqlen, d_head
+
+    assert k.shape[-2] % self.n_bins == 0
+    bin_size = int(k.shape[-2] // self.n_bins)
+
+    # q_bins/kv_bins are n_batch*n_heads, seqlen
+    # They specify which hash bucket the query/key/value vectors fall in. For
+    # now, instead of hashing we just put consecutive items in the same bucket.
+    q_bins = np.arange(q.shape[-2], dtype=np.int32) // bin_size
+    q_bins = jax.lax.tie_in(q, q_bins)
+    q_bins = q_bins[None, :]
+    q_bins = np.broadcast_to(q_bins, q.shape[:-1])
+    q_bins = -q_bins
+    kv_bins = q_bins * 2
+
+    # q_t/kv_t are n_batch*n_heads, seqlen
+    q_t = jax.lax.tie_in(q, np.arange(q.shape[-2]))
+    q_t = np.reshape(q_t, (1, q_t.shape[0]))
+    q_t = np.broadcast_to(q_t, q.shape[:-1])
+    kv_t = q_t
+
+    def chunk_scalars(x):
+      return np.reshape(x, (x.shape[0], self.n_bins, -1))
+
+    def chunk_vectors(x):
+      return np.reshape(
+          x, (x.shape[0], self.n_bins, -1, x.shape[-1]))
+
+    def unchunk_vectors(x):
+      return np.reshape(x, (x.shape[0], -1, x.shape[-1]))
+
+   # Sort everything by bin number (variables starting with "s" are sorted)
+    _, sq_t = jax.lax.sort_key_val(q_bins, q_t, dimension=-1)
+
+    sq = np.take_along_axis(q, sq_t[:, :, None], axis=-2)
+    if ct is not None:
+      so_ct = np.take_along_axis(ct, sq_t[:, :, None], axis=-2)
+
+    _, skv_t = jax.lax.sort_key_val(kv_bins, kv_t, dimension=-1)
+    sk = np.take_along_axis(k, skv_t[:, :, None], axis=-2)
+    sv = np.take_along_axis(v, skv_t[:, :, None], axis=-2)
+
+    @jax.jit
+    def binned_attn(sq, sk, sv):
+      """Performs attention on sorted queries/keys/values."""
+      # Split off a "bin" axis so that attention only occurs whithin chunks.
+      bq_t = chunk_scalars(sq_t)
+      bkv_t = chunk_scalars(skv_t)
+      bq = chunk_vectors(sq)
+      bk = chunk_vectors(sk)
+      bv = chunk_vectors(sv)
+
+      dots = np.matmul(bq, np.swapaxes(bk, -1, -2)) / np.sqrt(bq.shape[-1])
+
+      # Causal masking
+      mask = jax.lax.convert_element_type(
+          jax.lax.lt(bq_t[:, :, :, None], bkv_t[:, :, None, :]),
+          np.float32)
+      dots = dots - 1e9 * mask
+
+      # Softmax.
+      dots = np.exp(dots - dots.max(axis=-1, keepdims=True))
+      dots = dots / dots.sum(axis=-1, keepdims=True)
+      bo = np.matmul(dots, bv)
+
+      so = unchunk_vectors(bo)
+      return so
+
+    @jax.jit
+    def binned_attn_vjp(sq, sk, sv, so_ct):
+      so, vjpfun = jax.vjp(binned_attn, sq, sk, sv)
+      sqkv_ct = vjpfun(so_ct)
+      return so, sqkv_ct
+
+    if ct is None:
+      so = binned_attn(sq, sk, sv)
+      _, undo_q_sort = jax.lax.sort_key_val(sq_t, q_t, dimension=-1)
+      out = np.take_along_axis(so, undo_q_sort[:, :, None], axis=-2)
+      return out, None
+    else:
+      # Jax can construct a backward pass automatically, but it's about 2x
+      # slower than writing our own. The main reason is that the backward pass
+      # of gather is in general a scatter operation, but we know we're dealing
+      # with permutations so we use gather for the backward pass too.
+      so, (sq_ct, sk_ct, sv_ct) = binned_attn_vjp(sq, sk, sv, so_ct)
+
+      _, undo_q_sort = jax.lax.sort_key_val(sq_t, q_t, dimension=-1)
+      out = np.take_along_axis(so, undo_q_sort[:, :, None], axis=-2)
+      q_ct = np.take_along_axis(sq_ct, undo_q_sort[:, :, None], axis=-2)
+
+      _, undo_kv_sort = jax.lax.sort_key_val(skv_t, kv_t, dimension=-1)
+      k_ct = np.take_along_axis(sk_ct, undo_kv_sort[:, :, None], axis=-2)
+      v_ct = np.take_along_axis(sv_ct, undo_kv_sort[:, :, None], axis=-2)
+
+      return out, (q_ct, k_ct, v_ct)
+
+
+class ReversibleAttentionHalfResidual(tl.ReversibleLayer, tl.Serial):
   """Half of a RevNet-style residual that performs attention.
 
   If inputs are (x1, x2), then outputs are (x1 + z, x2) where:
@@ -496,143 +697,75 @@ class ReversibleAttentionHalfResidual(ReversibleLayerMixin, tl.Serial):
         self.subtract_top,
     ]
 
-  def inverse_and_vjp(self, output, ct, params=(), **kwargs):
+  def reverse(self, output, params=(), **kwargs):
     rng = kwargs.pop('rng', None)
     rngs = (None,) * self._n_layers
     if rng is not None:
       rngs = backend.random.split(rng, self._n_layers)
 
-    if ct is None:
-      reconstructed_x = output
-      # Note that self.sublayers() aligns exactly with self.reverse_layers in
-      # terms of parameter and rng usage, so no re-ordering is required.
-      for layer, p, rng in zip(self.reverse_layers, params, rngs):
-        reconstructed_x = layer(reconstructed_x, p, rng=rng, **kwargs)
-      return reconstructed_x, None
-    else:
-      # Forward pass through self.pre_attention, while preparing for
-      # later backprop.
-      # Note: jax.vjp does not allow us to use **kwargs in the signature here.
-      def call_pre_attention(x, params, kwargs):
-        return self.pre_attention(x, params, **kwargs)
-      pre_attention_kwargs = kwargs.copy()
-      pre_attention_kwargs['rng'] = rngs[0]
-      stack, pre_attention_vjpfun = jax.vjp(
-          call_pre_attention, output, params[0], pre_attention_kwargs)
+    reconstructed_x = output
+    # Note that self.sublayers() aligns exactly with self.reverse_layers in
+    # terms of parameter and rng usage, so no re-ordering is required.
+    for layer, p, rng in zip(self.reverse_layers, params, rngs):
+      reconstructed_x = layer.reverse(reconstructed_x, p, rng=rng, **kwargs)
+    return reconstructed_x
 
-      # Backprop through adding the residual
-      assert len(ct) == 2
-      ct = saved_ct = (ct[0], ct[0], ct[1])
-
-      # Backprop through self.post_attention with respect to the inputs only
-      call_post_attention_kwargs = kwargs.copy()
-      call_post_attention_kwargs['rng'] = rngs[2]
-      def call_post_attention(x):
-        return self.post_attention(x, params[2], **call_post_attention_kwargs)
-      # Note: these are *not* the actual inputs to self.post_attention.
-      # If self.post_attention is not linear, we will get incorrect gradients.
-      dummy_inputs = (stack[-3], stack[-2], stack[-1])
-      _, post_attention_vjpfun = jax.vjp(call_post_attention, dummy_inputs)
-      (ct,) = post_attention_vjpfun(ct)
-
-      # Simultaneous forward pass and backprop through the attention mechanism
-      attention_kwargs = kwargs.copy()
-      attention_kwargs['rng'] = rngs[1]
-      stack, ct = self.attention.forward_and_vjp(
-          stack, ct, **attention_kwargs)
-      attention_params_ct = ()
-
-      # Backprop through self.pre_attention
-      (x_ct,
-       pre_attention_params_ct,
-       pre_attention_kwargs_ct) = pre_attention_vjpfun(ct)
-
-      # Forward pass for self.post_attention, and backprop with respect to the
-      # parameters only
-      def call_post_attention2(params, kwargs):
-        return self.post_attention(stack, params, **kwargs)
-      stack, post_attention_vjpfun = jax.vjp(
-          call_post_attention2, params[2], call_post_attention_kwargs)
-      (post_attention_params_ct,
-       post_attention_kwargs_ct) = post_attention_vjpfun(saved_ct)
-
-      # Forward pass through subtracting the residual
-      reconstructed_x = self.subtract_top(
-          stack, params[-1], rng=rngs[-1], **kwargs)
-
-      params_ct = (
-          pre_attention_params_ct,
-          attention_params_ct,
-          post_attention_params_ct,
-          (),
-          )
-
-      # We don't actually backprop through the kwargs, but the API requires that
-      # we provide a value for kwargs_ct.
-      kwargs_ct = pre_attention_kwargs_ct
-      del post_attention_kwargs_ct
-
-      return reconstructed_x, (x_ct, params_ct, kwargs_ct)
-
-
-class ReversibleSwap(ReversibleLayerMixin, tl.Swap):
-  """Swap the first two element on the stack."""
-
-  def inverse_and_vjp(self, output, ct, params=(), **kwargs):
-    if ct is None:
-      # Swap is its own inverse
-      return self.call(output, params, **kwargs), None
-    else:
-      return super(ReversibleSwap, self).inverse_and_vjp(
-          output, ct, params, **kwargs)
-
-
-class ReversibleSerial(ReversibleLayerMixin, tl.Serial):
-  """A reversible version of tl.Serial (requires reversible sub-layers)."""
-
-  def __init__(self, *layers):
-    super(ReversibleSerial, self).__init__(*layers)
-
-    # Note that sublayers has already been flattened to remove nested lists.
-    for i, layer in enumerate(self.sublayers()):
-      if not isinstance(layer, ReversibleLayerMixin):
-        raise ValueError(
-            'Sub-layer {} of ReversibleSerial is not reversible: {}'.format(
-                i, layer))
-
-  def inverse_and_vjp(self, output, ct, params=(), **kwargs):
+  def reverse_and_grad(self, output, ct, params=(), **kwargs):
     rng = kwargs.pop('rng', None)
     rngs = (None,) * self._n_layers
     if rng is not None:
       rngs = backend.random.split(rng, self._n_layers)
 
-    layer_val = output
-    if ct is not None:
-      layer_ct = ct
-      params_ct = []
-    for layer, p, rng in reversed(zip(self.sublayers(), params, rngs)):
-      layer_val, layer_ct = layer.inverse_and_vjp(
-          layer_val, layer_ct, p, rng=rng, **kwargs)
-      if ct is not None:
-        layer_ct, p_ct, kwargs_ct = layer_ct
-        params_ct.insert(0, p_ct)
+    # Forward pass through self.pre_attention, while preparing for
+    # later backprop.
+    def call_pre_attention(x, params):
+      return self.pre_attention(x, params, rng=rngs[0], **kwargs)
+    stack, pre_attention_vjpfun = jax.vjp(call_pre_attention, output, params[0])
 
-    # TODO(kitaev): Handle kwargs_ct properly. However, kwargs generally only
-    # contains the rng, which is non-differentiable.
-    for k in kwargs:
-      if k != 'rng':
-        raise NotImplementedError(
-            'ReversibleSerial does not support differentiation wrt kwargs,'
-            'and the key {} is not known to be non-differentiable.'.format(k))
+    # Backprop through adding the residual
+    assert len(ct) == 2
+    ct = saved_ct = (ct[0], ct[0], ct[1])
 
-    if ct is not None:
-      return layer_val, (layer_ct, params_ct, kwargs_ct)
-    else:
-      return layer_val, None
+    # Backprop through self.post_attention with respect to the inputs only
+    def call_post_attention(x):
+      return self.post_attention(x, params[2], rng=rngs[2], **kwargs)
+    # Note: these are *not* the actual inputs to self.post_attention.
+    # If self.post_attention is not linear, we will get incorrect gradients.
+    dummy_inputs = (stack[-3], stack[-2], stack[-1])
+    _, post_attention_vjpfun = jax.vjp(call_post_attention, dummy_inputs)
+    (ct,) = post_attention_vjpfun(ct)
+
+    # Simultaneous forward pass and backprop through the attention mechanism
+    stack, ct = self.attention.forward_and_vjp(
+        stack, ct, rng=rngs[1], **kwargs)
+    attention_params_ct = ()
+
+    # Backprop through self.pre_attention
+    x_ct, pre_attention_params_ct = pre_attention_vjpfun(ct)
+
+    # Forward pass for self.post_attention, and backprop with respect to the
+    # parameters only
+    def call_post_attention2(params):
+      return self.post_attention(stack, params, rng=rngs[2], **kwargs)
+    stack, post_attention_vjpfun = jax.vjp(call_post_attention2, params[2])
+    (post_attention_params_ct,) = post_attention_vjpfun(saved_ct)
+
+    # Forward pass through subtracting the residual
+    reconstructed_x = self.subtract_top(
+        stack, params[-1], rng=rngs[-1], **kwargs)
+
+    params_ct = (
+        pre_attention_params_ct,
+        attention_params_ct,
+        post_attention_params_ct,
+        (),
+        )
+
+    return reconstructed_x, (x_ct, params_ct)
 
 
 def DecoderBlock(d_model, d_ff, d_attention_key, d_attention_value,
-                 n_heads, n_attention_chunks, attention_loop_stride,
+                 n_heads, n_attention_chunks, attention_type,
                  dropout, mode):
   """Reversible transformer decoder layer.
 
@@ -643,8 +776,7 @@ def DecoderBlock(d_model, d_ff, d_attention_key, d_attention_value,
     d_attention_value: int: depth of value vector for each attention head
     n_heads: int: number of attention heads
     n_attention_chunks: int: number of chunks for attention
-    attention_loop_stride: int: number of query elements to compute attention
-      for in parallel. Set to 0 to disable memory-efficient attention.
+    attention_type: class: attention class to use, such as DotProductAttention.
     dropout: float: dropout rate (how much to drop out)
     mode: str: 'train' or 'eval'
 
@@ -653,30 +785,24 @@ def DecoderBlock(d_model, d_ff, d_attention_key, d_attention_value,
   """
 
   pre_attention = [
-      Chunk(sections=n_attention_chunks),  # pylint: disable=no-value-for-parameter
+      Chunk(n_sections=n_attention_chunks),  # pylint: disable=no-value-for-parameter
       tl.LayerNorm(),
       tl.Dup(), tl.Dup(),
       tl.Parallel(
-          [tl.Dense(d_attention_key * n_heads), SplitHeads(n_heads=n_heads)],  # pylint: disable=no-value-for-parameter
-          [tl.Dense(d_attention_key * n_heads), SplitHeads(n_heads=n_heads)],  # pylint: disable=no-value-for-parameter
-          [tl.Dense(d_attention_value * n_heads), SplitHeads(n_heads=n_heads)],  # pylint: disable=no-value-for-parameter
+          [ComputeAttentionHeads(n_heads=n_heads, d_head=d_attention_key)],
+          [ComputeAttentionHeads(n_heads=n_heads, d_head=d_attention_key)],
+          [ComputeAttentionHeads(n_heads=n_heads, d_head=d_attention_value)],
       ),
   ]
 
-  # TODO(kitaev): add dropout
-  if attention_loop_stride < 1:
-    # Use the standard implementation if no loop_stride is provided.
-    attention = DotProductAttention(dropout=None, mode=mode)
-  else:
-    attention = MemoryEfficientDotProductAttention(
-        loop_stride=attention_loop_stride, dropout=None, mode=mode)
+  attention = attention_type(mode=mode)
 
   # ReversibleAttentionHalfResidual requires that post_attention be linear in
   # its input (so the backward pass can be computed without knowing the input)
   post_attention = [
-      JoinHeads(),  # pylint: disable=no-value-for-parameter
-      tl.Dense(d_model),
-      Unchunk(sections=n_attention_chunks),  # pylint: disable=no-value-for-parameter
+      ComputeAttentionOutput(n_heads=n_heads, d_model=d_model),
+      Unchunk(n_sections=n_attention_chunks),  # pylint: disable=no-value-for-parameter
+      BroadcastedDropout(rate=dropout, mode=mode),  # pylint: disable=no-value-for-parameter
   ]
 
   feed_forward = [
@@ -684,9 +810,9 @@ def DecoderBlock(d_model, d_ff, d_attention_key, d_attention_value,
   ]
   return [
       ReversibleAttentionHalfResidual(pre_attention, attention, post_attention),
-      ReversibleSwap(),
+      tl.ReversibleSwap(),
       ReversibleHalfResidual(feed_forward),
-      ReversibleSwap(),
+      tl.ReversibleSwap(),
   ]
 
 
@@ -701,7 +827,7 @@ def TransformerRevnetLM(vocab_size,
                         max_len=2048,
                         n_chunks=32,
                         n_attention_chunks=8,
-                        attention_loop_stride=0,
+                        attention_type=DotProductAttention,
                         mode='train'):
   """Reversible transformer language model (only uses a decoder, no encoder).
 
@@ -717,8 +843,7 @@ def TransformerRevnetLM(vocab_size,
     max_len: int: maximum symbol length for positional encoding
     n_chunks: int: number of chunks (must match input pipeline)
     n_attention_chunks: int: number of chunks for attention
-    attention_loop_stride: int: number of query elements to compute attention
-      for in parallel. Set to 0 to disable memory-efficient attention.
+    attention_type: class: attention class to use, such as DotProductAttention.
     mode: str: 'train' or 'eval'
 
   Returns:
@@ -726,7 +851,7 @@ def TransformerRevnetLM(vocab_size,
   """
   positional_embedder = [
       tl.Embedding(d_model, vocab_size),
-      # TODO(kitaev): add dropout
+      BroadcastedDropout(rate=dropout, mode=mode),  # pylint: disable=no-value-for-parameter
       tl.PositionalEncoding(max_len=max_len),
   ]
   return tl.Model(
@@ -734,20 +859,22 @@ def TransformerRevnetLM(vocab_size,
       tl.ShiftRight(),
       positional_embedder,
       tl.Dup(),
-      ReversibleSerial([
+      tl.ReversibleSerial([
           # pylint: disable=g-complex-comprehension
           DecoderBlock(d_model, d_ff,
                        d_attention_key, d_attention_value, n_heads,
-                       n_attention_chunks, attention_loop_stride,
+                       n_attention_chunks, attention_type,
                        dropout, mode)
           for _ in range(n_layers)
+      ] + [
+          SplitForOutput(n_sections=n_chunks, axis=-2),  # pylint: disable=no-value-for-parameter
       ]),
-      tl.Parallel(tl.LayerNorm(), tl.LayerNorm()),
-      tl.Concatenate(),
-      Split(sections=n_chunks, axis=-2),  # pylint: disable=no-value-for-parameter
       Map([
+          # TODO(kitaev): Test whether dropout should go before or after the
+          # LayerNorm, and whether dropout broadcasting is needed here.
+          tl.LayerNorm(),
+          BroadcastedDropout(rate=dropout, mode=mode),  # pylint: disable=no-value-for-parameter
           tl.Dense(vocab_size),
           tl.LogSoftmax(),
-      ], sections=n_chunks),
+      ], n_sections=n_chunks),
   )
-

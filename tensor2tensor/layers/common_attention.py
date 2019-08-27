@@ -619,7 +619,7 @@ def add_timing_signal_nd(x, min_timescale=1.0, max_timescale=1.0e4):
   memory inputs to attention.
 
   The use of relative position is possible because sin(a+b) and cos(a+b) can be
-  experessed in terms of b, sin(a) and cos(a).
+  expressed in terms of b, sin(a) and cos(a).
 
   x is a Tensor with n "positional" dimensions, e.g. one dimension for a
   sequence or two dimensions for an image
@@ -1570,7 +1570,7 @@ def dot_product_attention(q,
   """
   with tf.variable_scope(
       name, default_name="dot_product_attention", values=[q, k, v]) as scope:
-    logits = tf.matmul(q, k, transpose_b=True)  # [..., length_q, length_kv]
+    logits = tf.einsum("...kd,...qd->...qk", k, q)
     if bias is not None:
       bias = common_layers.cast_like(bias, logits)
       logits += bias

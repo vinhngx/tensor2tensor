@@ -1546,7 +1546,10 @@ class T2TModel(base.Layer):
     return create_host_call(self.hparams.model_dir)
 
   def create_eval_host_call(self):
-    return self.create_train_host_call()
+    eval_dir = os.path.join(
+        self.hparams.model_dir,
+        self.hparams.get("eval_dir_name", "eval"))
+    return create_host_call(eval_dir)
 
   def estimator_spec_train(self, loss, num_async_replicas=1, use_tpu=False):
     """Constructs `tf.estimator.EstimatorSpec` for TRAIN (training) mode."""
@@ -1818,10 +1821,11 @@ class T2TModel(base.Layer):
 
     # Only do scheduled sampling on language tasks.
     modality = problem_hparams.modality["targets"]
-    if modality != modalities.ModalityType.SYMBOL:
+    if modality not in [modalities.ModalityType.SYMBOL,
+                        modalities.ModalityType.SYMBOL_WEIGHTS_ALL]:
       assert hparams.scheduled_sampling_prob == 0, (
-          "Scheduled sampling only applies to ModalityType.SYMBOL. Set "
-          "hparams.scheduled_sampling_prob == 0.0.")
+          "Scheduled sampling only applies to ModalityType.{SYMBOL, "
+          "SYMBOL_WEIGHTS_ALL}. Set hparams.scheduled_sampling_prob == 0.0.")
       return (logits, losses)
 
     # Only do scheduled sampling when training.

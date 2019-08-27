@@ -80,7 +80,6 @@ def optimize(loss,
       setattr(opt, "_use_locking", "True")
       setattr(opt, "_name", "ConditionalOptimizer")
       opt = tf.train.experimental.enable_mixed_precision_graph_rewrite(opt)
-
   opt_summaries = []
   if common_layers.should_generate_summaries():
     tf.summary.scalar("learning_rate", learning_rate)
